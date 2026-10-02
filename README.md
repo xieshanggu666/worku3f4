@@ -79,7 +79,7 @@ npm run dev     # 同时启动后端(4160) 与 前端 Vite
 | `crisis_tickets` | 危机处置工单（责任到人，创建/改派/流转均上链并回写通知责任人） |
 | `crisis_reports` | 危机复盘报告（草稿可改，定稿强制校验哈希链并固化从审计链汇总的责任矩阵；定稿后不可改） |
 | `schedule_slots` | 面试官/候选人**可用时段池**（`owner_type` 归属方、`source=self/recruiter` 本人维护或 HR 代录、`open/used` 状态与占用预约联动） |
-| `appointments` | 双向预约单（协商状态机 `negotiating/confirmed/rescheduling/declined/completed/no_show/cancelled` + 双方确认位 `cand_confirmed/int_confirmed` + 改期提议 `pending_*` + 提醒幂等位） |
+| `appointments` | 双向预约单（协商状态机 `negotiating/confirmed/rescheduling/declined/completed/no_show/cancelled` + 双方确认位 `cand_confirmed/int_confirmed` + 改期提议 `pending_*` + 提醒幂等位 + `crisis_suspended/incident_id` 危机回退挂起标记） |
 | `appointment_messages` | 预约沟通留痕（发起/确认/改期/拒绝改期/婉拒/取消/提醒/缺席裁定/重约，只追加，形成协商时间线） |
 
 ## 候选人↔面试官双向预约沟通（📅 预约沟通）
@@ -116,7 +116,7 @@ npm run dev     # 同时启动后端(4160) 与 前端 Vite
 - **事件立案**：任意角色可立案（P0 特急/P1 重大/P2 一般），可关联一条在途应聘；**指挥官**可跨角色指定（默认招聘负责人），立案即生成事件号 `CR-YYYYMMDD-NNN` 与审计链根条目。事件状态机：已立案 → 处置中 → 已遏制 ⇄ 复盘中 → 已结案。
 - **不可篡改哈希链**：关键操作（`action`）、授权变更（`authorization`）、状态回退（`rollback`）、审批决策（`decision`）、工单（`ticket`）、复盘定稿（`report`）、结案（`close`）逐条追加到 `crisis_audit_entries`；每条 `entry_hash = SHA256(prev_hash + 本条全字段)`，根哈希绑定事件号。应用层 `/api/crisis/incidents/:id/verify` 按库内原文逐链重算校验，数据库层另有 `BEFORE UPDATE/DELETE` 触发器兜底，任何改写/删除都会被拒绝；即使触发器被绕过，内容篡改与条目删除都会在重算时暴露（哈希不匹配/序号与 prev_hash 断裂）。支持导出完整审计包 JSON。
 - **跨角色临时授权**：指挥官可把任一角色权限临时授予事件成员（**事由必填留痕**），授权/收回各上一条链；被授权人成为事件成员后可执行处置操作；**结案自动收回全部有效授权**。
-- **危机状态回退**：事件成员可对关联应聘执行紧急回退（原因必填、豁免乐观锁版本），后端复用与普通异常回退完全相同的 `rollbackStage` 状态机（Offer 撤回联动、淘汰按来源复活），回退动作在同一 SQLite 事务内上链。此外，关联事件的应聘走**主流程回退/淘汰**或**审批终审执行/失败**时，也会被动追加审计条目，审计与业务要么同时成功要么一起回滚。
+- **危机状态回退**：事件成员可对关联应聘执行紧急回退（原因必填、豁免乐观锁版本），后端复用与普通异常回退完全相同的 `rollbackStage` 状态机（Offer 撤回联动、淘汰按来源复活），回退动作在同一 SQLite 事务内上链。回退在同一事务内**同步处置在途协同**并逐条上链：① 回退到筛选/投递阶段时把进行中（待确认/改期中/已确认）的面试预约**挂起**（置为 `cancelled` 并打 `crisis_suspended` 标记、清空确认位与提醒幂等位、释放双方时段、同步 `interviews` 表、追加协商留痕）；复活回面试阶段时保留协商中的预约；② **撤销该应聘全部待审批任务**并补写 `cancel` 审批留痕（退回态任务保留，由申请人自行重提/撤销）；③ 把已失效的预约（`sched_*`）/审批（`task_*`）未读通知**归并为已读**，清除铃铛与红点残留（危机处置类通知保留未读）。之后在挂起预约原单上**重新协商**或缺席**重约**、双方再次确认时，系统被动追加 `schedule.rebook`/`schedule.confirmed` 审计条目，面试流程随重约/复活结果恢复。此外，关联事件的应聘走**主流程回退/淘汰**或**审批终审执行/失败**时，也会被动追加审计条目，审计与业务要么同时成功要么一起回滚。
 - **处置工单**：工单责任到人（open→processing→resolved→closed），创建即按角色通知责任人；**改派会把未读通知的责任归属同步回写**；解决必须填写处置结果。
 - **复盘与责任回写**：事件成员可写复盘草稿（结论/根因/改进措施），**仅指挥官可定稿**；定稿前系统强制重算哈希链、要求无未关闭工单，随后把「指挥官/立案人/每位处置人的操作数与类别/授权清单/工单责任/回退次数」汇总为**责任矩阵**固化进定稿条目与报告，并回写事件全部未读通知的责任人。结案前必须先定稿，结案追加归档条目并收回授权。
 - **API**：`POST /api/crisis/incidents`（立案）、`…/:id/state|commander|rollback|actions|grants|tickets|report/finalize|close|verify|export`、`POST /api/crisis/grants/:gid/revoke`、`POST /api/crisis/tickets/:tid`（改派/流转）；危机通知（`crisis_*`）点击铃铛直达危机审计页。

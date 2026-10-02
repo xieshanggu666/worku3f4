@@ -459,6 +459,11 @@ addColumn('offers', 'decided_at', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'decided_by', `TEXT NOT NULL DEFAULT ''`)
 addColumn('offers', 'joined_at', `TEXT NOT NULL DEFAULT ''`)
 
+// 危机回退同步：进行中的预约被危机处置挂起（status 复用 cancelled，crisis_suspended=1 标记），
+// 之后可在原单上「重新协商」恢复后续流程；incident_id 保留来源事件用于追溯
+addColumn('appointments', 'crisis_suspended', `INTEGER NOT NULL DEFAULT 0`)
+addColumn('appointments', 'incident_id', `INTEGER NOT NULL DEFAULT 0`)
+
 // 危机处置审计模块：通知表补齐「责任回写」列（旧库升级）
 addColumn('notifications', 'incident_id', `INTEGER NOT NULL DEFAULT 0`)
 addColumn('notifications', 'ticket_id', `INTEGER NOT NULL DEFAULT 0`)

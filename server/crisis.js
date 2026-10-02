@@ -5,6 +5,7 @@
 import express from 'express'
 import crypto from 'node:crypto'
 import db, { ts } from './db.js'
+import { suspendAppointmentsForIncident } from './schedule.js'
 
 export const router = express.Router()
 
@@ -44,6 +45,8 @@ export const ACTION_LABEL = {
   'incident.declare': '事件立案', 'incident.state': '事件状态流转', 'incident.commander': '指挥官变更',
   'incident.close': '结案归档', 'authz.grant': '临时授权', 'authz.revoke': '收回授权',
   'state.rollback': '流程状态回退', 'state.reject': '流程淘汰',
+  'schedule.suspend': '预约同步挂起', 'schedule.rebook': '预约重约恢复', 'schedule.confirmed': '预约确认恢复',
+  'approval.auto_cancel': '待审任务同步撤销', 'notification.sync_read': '未读通知同步归并',
   'approval.execute': '审批执行回写', 'approval.failed': '审批执行失败',
   'ticket.create': '创建工单', 'ticket.assign': '工单改派', 'ticket.transition': '工单流转',
   'report.finalize': '复盘定稿'
@@ -149,15 +152,15 @@ export function auditPassive({ category, action, actor, applicationId, refType =
 }
 
 // ---------------- 通知（责任回写） ----------------
-function notifyOne({ recipientRole, type, title, body, appId = 0, incidentId = 0, ticketId = 0, owner = null }) {
+function notifyOne({ recipientRole, type, title, body, appId = 0, incidentId = 0, ticketId = 0, taskId = 0, owner = null }) {
   db.prepare(`INSERT INTO notifications
     (recipient_role,type,title,body,task_id,application_id,is_read,created_at,incident_id,ticket_id,owner_name,owner_user_id)
-    VALUES(?,?,?,? ,0,?,0,?,?,?,?,?)`)
-    .run(recipientRole, type, title, body, num(appId), ts(), num(incidentId), num(ticketId), owner?.name || '', owner?.id || '')
+    VALUES(?,?,?,? ,?,?,0,?,?,?,?,?)`)
+    .run(recipientRole, type, title, body, num(taskId), num(appId), ts(), num(incidentId), num(ticketId), owner?.name || '', owner?.id || '')
 }
 // 危机处置按角色全员触达（跨角色协同）；每条通知固化当前责任人，便于铃铛/工单/复盘回查
-function notifyAllRoles(type, { title, body, appId = 0, incidentId = 0, ticketId = 0, owner = null }) {
-  CRISIS_ROLES.forEach(role => notifyOne({ recipientRole: role, type, title, body, appId, incidentId, ticketId, owner }))
+function notifyAllRoles(type, { title, body, appId = 0, incidentId = 0, ticketId = 0, taskId = 0, owner = null }) {
+  CRISIS_ROLES.forEach(role => notifyOne({ recipientRole: role, type, title, body, appId, incidentId, ticketId, taskId, owner }))
 }
 // 把最新责任人回写到该事件/工单尚未读的通知上（责任变更不丢失历史，只刷新待办归属）
 function rewriteUnreadOwner({ incidentId, ticketId, owner }) {
@@ -380,6 +383,45 @@ router.post('/grants/:gid/revoke', wrap((req, res) => {
 }))
 
 // ---------------- 危机状态回退（跨角色紧急处置，复用主流程状态机） ----------------
+// 三类审批任务的可读名（同步撤销待审任务时留痕/通知用）
+const TASK_TYPE_LABEL = { stage_advance: '候选人推进', interview_conclusion: '面试结论', offer_issue: 'Offer 发放' }
+
+// 同步撤销该应聘全部「待审批」任务（退回态保留，由申请人自行决定重提/撤销）：
+// 任务状态、步骤留痕与业务回退在同一事务内完成；返回被撤销任务清单供上链
+function cancelPendingTasksForIncident(appId, { actor, reason }) {
+  const tasks = db.prepare("SELECT * FROM approval_tasks WHERE application_id=? AND status='pending' ORDER BY id").all(appId)
+  const stamp = ts()
+  const cancelled = []
+  tasks.forEach(t => {
+    db.prepare("UPDATE approval_tasks SET status='cancelled', decided_at=?, decide_note=?, version=version+1 WHERE id=?")
+      .run(stamp, `危机处置同步撤销：${reason}`, t.id)
+    db.prepare(`INSERT INTO approval_steps(task_id,step_no,role,action,actor_id,actor_name,note,acted_at)
+                VALUES(?,?,?,?,?,?,?,?)`)
+      .run(t.id, num(t.current_step), actor?.role || '', 'cancel', actor?.id || '', actor?.name || '',
+        `危机回退自动撤销待审任务：${reason}`, stamp)
+    cancelled.push({
+      id: t.id, type: t.type, type_label: TASK_TYPE_LABEL[t.type] || t.type,
+      current_step: num(t.current_step)
+    })
+  })
+  return cancelled
+}
+
+// 归并该应聘的在途未读通知：预约协商（sched_*）与审批待办（task_*）已随回退失效，
+// 直接标记已读避免铃铛/红点残留；危机处置类通知保留未读（仍是处置待办）。返回按类型计数
+function syncUnreadNotificationsForIncident(appId) {
+  const rows = db.prepare(`SELECT id,type,recipient_role FROM notifications
+                           WHERE application_id=? AND is_read=0
+                             AND (type LIKE 'sched_%' OR type LIKE 'task_%')`).all(num(appId))
+  if (rows.length) {
+    const marks = rows.map(() => '?').join(',')
+    db.prepare(`UPDATE notifications SET is_read=1 WHERE id IN (${marks})`).run(...rows.map(r => r.id))
+  }
+  const byType = {}
+  rows.forEach(r => { byType[r.type] = (byType[r.type] || 0) + 1 })
+  return { count: rows.length, ids: rows.map(r => num(r.id)), by_type: byType }
+}
+
 router.post('/incidents/:id/rollback', wrap((req, res) => {
   const user = currentUser(req)
   const incidentId = num(req.params.id)
@@ -392,23 +434,93 @@ router.post('/incidents/:id/rollback', wrap((req, res) => {
     if (inc.status === 'closed') conflict('事件已结案，不能再执行回退', 'incident_closed')
     const appId = num(req.body?.application_id) || num(inc.application_id)
     if (!appId) badRequest('该事件未关联应聘记录，请在立案时关联或显式指定 application_id', 'app_missing')
-    // 与主流程共用 rollbackStage：撤回联动 Offer、写 rollback 阶段事件均保持一致；危机处置豁免乐观锁
+    const revived = (() => {
+      const before = db.prepare('SELECT stage FROM applications WHERE id=?').get(appId)
+      return before?.stage === 'rejected'
+    })()
+    // 1) 与主流程共用 rollbackStage：撤回联动 Offer、写 rollback 阶段事件均保持一致；危机处置豁免乐观锁
     const r = core.rollbackForIncident(appId, user.name, reason)
     appendEntry(inc.id, {
       category: 'rollback', action: 'state.rollback', actor: actorOf(user),
       refType: 'application', refId: appId,
-      summary: `危机处置状态回退：${r.fromLabel} → ${r.toLabel}`,
+      summary: `危机处置状态回退：${r.fromLabel} → ${r.toLabel}${revived ? '（淘汰复活）' : ''}`,
       detail: {
         application_id: appId, from: r.from, to: r.to, reason,
-        via: 'crisis_command', offer_withdrawn: !!r.offerWithdrawn
+        via: 'crisis_command', revived, offer_withdrawn: !!r.offerWithdrawn
       }
     })
+
+    // 2) 同步处理进行中的面试预约：回退到面试以前阶段挂起协商；回退到面试/淘汰复活（回面试）时保留协商
+    const suspendAppointments = !revived && ['submitted', 'screening'].includes(r.to)
+    let suspended = []
+    if (suspendAppointments) {
+      suspended = suspendAppointmentsForIncident(appId, { incidentId: inc.id, actor: actorOf(user), reason })
+      appendEntry(inc.id, {
+        category: 'rollback', action: 'schedule.suspend', actor: actorOf(user),
+        refType: 'appointment',
+        refId: suspended.length ? suspended.map(a => a.id).join(',') : '',
+        summary: suspended.length
+          ? `同步挂起 ${suspended.length} 个进行中的面试预约（时段已释放，可在原单重约恢复）`
+          : '进行中的面试预约无需挂起',
+        detail: { application_id: appId, reason, appointments: suspended }
+      })
+      if (suspended.length) {
+        notifyAllRoles('crisis_appt_suspended', {
+          title: `⏸️ ${inc.code} 面试预约已随危机回退挂起`,
+          body: `${user.name} 因「${reason}」回退流程，${suspended.length} 个进行中预约已挂起并释放时段，待流程恢复后在原单重新约期`,
+          appId, incidentId: inc.id, owner: { id: inc.commander_id, name: inc.commander_name }
+        })
+      }
+    }
+
+    // 3) 同步撤销待审批任务：回退后申请内容对应的业务前置已失效，终审执行必然漂移，统一撤销留痕
+    const cancelledTasks = cancelPendingTasksForIncident(appId, { actor: actorOf(user), reason })
+    appendEntry(inc.id, {
+      category: 'decision', action: 'approval.auto_cancel', actor: actorOf(user),
+      refType: 'approval',
+      refId: cancelledTasks.length ? cancelledTasks.map(t => t.id).join(',') : '',
+      summary: cancelledTasks.length
+        ? `同步撤销 ${cancelledTasks.length} 个待审批任务（${cancelledTasks.map(t => t.type_label).join('、')}）`
+        : '无进行中的待审批任务',
+      detail: { application_id: appId, reason, tasks: cancelledTasks }
+    })
+    cancelledTasks.forEach(t => {
+      // 通知申请人角色：推进/Offer 由招聘负责人发起，面试结论由面试官发起
+      const submitterRole = t.type === 'interview_conclusion' ? 'interviewer' : 'recruiter'
+      notifyOne({
+        recipientRole: submitterRole,
+        type: 'crisis_task_cancelled',
+        title: `⏸️ ${inc.code} 审批任务已随危机回退撤销`,
+        body: `「${t.type_label}」申请 #${t.id} 因流程危机回退（${reason}）被同步撤销，流程恢复后可重新发起`,
+        appId, incidentId: inc.id, taskId: t.id,
+        owner: { id: inc.commander_id, name: inc.commander_name }
+      })
+    })
+
+    // 4) 未读通知归并：失效的预约/审批未读提醒统一已读，铃铛/红点不再残留旧待办
+    const readSync = syncUnreadNotificationsForIncident(appId)
+    appendEntry(inc.id, {
+      category: 'action', action: 'notification.sync_read', actor: actorOf(user),
+      refType: 'notification',
+      refId: readSync.ids.slice(0, 50).join(','),
+      summary: readSync.count
+        ? `同步归并 ${readSync.count} 条失效的预约/审批未读通知为已读`
+        : '无失效的未读通知需要归并',
+      detail: { application_id: appId, count: readSync.count, notification_ids: readSync.ids, by_type: readSync.by_type }
+    })
+
     notifyAllRoles('crisis_rollback', {
-      title: `⏪ ${inc.code} 执行状态回退`,
-      body: `${user.name} 因「${reason}」将应聘流程从「${r.fromLabel}」回退到「${r.toLabel}」`,
+      title: `⏪ ${inc.code} 执行状态回退（已同步后续协同）`,
+      body: `${user.name} 因「${reason}」将应聘流程从「${r.fromLabel}」回退到「${r.toLabel}」`
+        + `：挂起预约 ${suspended.length} 个、撤销待审 ${cancelledTasks.length} 个、归并未读 ${readSync.count} 条`,
       appId, incidentId: inc.id, owner: { id: inc.commander_id, name: inc.commander_name }
     })
-    return { ok: true, ...r }
+    return {
+      ok: true, ...r, revived,
+      appointments_suspended: suspended,
+      tasks_cancelled: cancelledTasks,
+      notifications_read: readSync.count
+    }
   })
   res.json(out)
 }))

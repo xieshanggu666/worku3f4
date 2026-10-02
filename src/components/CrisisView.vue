@@ -80,7 +80,14 @@ const rbReason = ref('')
 async function doRollback() {
   if (!rbReason.value.trim()) { store.notify('error', '危机回退必须填写处置原因'); return }
   const r = await store.crisisRollback(selected.value.id, { reason: rbReason.value })
-  if (r?.ok) { rbReason.value = ''; store.notify('success', `已回退：${r.fromLabel} → ${r.toLabel}`) }
+  if (r?.ok) {
+    rbReason.value = ''
+    const parts = [`已回退：${r.fromLabel} → ${r.toLabel}${r.revived ? '（淘汰复活）' : ''}`]
+    parts.push(`挂起预约 ${r.appointments_suspended?.length || 0}`)
+    parts.push(`撤销待审 ${r.tasks_cancelled?.length || 0}`)
+    parts.push(`归并未读 ${r.notifications_read || 0}`)
+    store.notify('success', parts.join(' · '))
+  }
 }
 const tkForm = ref({ title: '', content: '', priority: 'P2', owner_id: '' })
 async function addTicket() {
@@ -314,7 +321,7 @@ function roleChip(role) { return ROLE_LABEL[role] || role }
                 <b class="n-summary">{{ e.summary }}</b>
                 <div class="n-hash muted">
                   <span v-if="e.target_role">🔑 涉及角色：<b>{{ roleChip(e.target_role) }}</b> · </span>
-                  <span v-if="e.ref_type">{{ {application:'应聘',approval:'审批',offer:'Offer',grant:'授权',ticket:'工单',report:'复盘'}[e.ref_type] || e.ref_type }} #{{ e.ref_id }} · </span>
+                  <span v-if="e.ref_type">{{ {application:'应聘',approval:'审批',offer:'Offer',grant:'授权',ticket:'工单',report:'复盘',appointment:'预约',notification:'通知'}[e.ref_type] || e.ref_type }} <template v-if="e.ref_id">#{{ e.ref_id }}</template> · </span>
                   hash <code :title="e.entry_hash">{{ e.entry_hash.slice(0, 14) }}…</code>
                 </div>
                 <details v-if="e.detail && Object.keys(e.detail).length">
@@ -341,7 +348,13 @@ function roleChip(role) { return ROLE_LABEL[role] || role }
             </div>
             <div class="op-card card" v-if="selected.application_id">
               <h3>⏪ 危机状态回退</h3>
-              <p class="muted">将关联应聘「{{ appLabel(selected.application_id) }}」回退到上一阶段（淘汰记录按来源复活；Offer 阶段会联动撤回 Offer）。该操作豁免前端乐观锁并直接上链。</p>
+              <p class="muted">将关联应聘「{{ appLabel(selected.application_id) }}」回退到上一阶段（淘汰记录按来源复活；Offer 阶段会联动撤回 Offer）。回退在<b>同一事务</b>内同步处置并逐条上链：</p>
+              <ul class="rb-sync muted">
+                <li>📅 回退到筛选/投递阶段时，<b>挂起进行中的面试预约</b>并释放时段（可在原单重约恢复）；复活回面试阶段时保留协商</li>
+                <li>⚖️ <b>撤销全部待审批任务</b>并补写撤销留痕（流程恢复后可重新发起）</li>
+                <li>🔔 <b>归并已失效的预约/审批未读通知</b>，清除铃铛与红点残留</li>
+                <li>🔄 之后在原单上<b>重约/确认</b>恢复预约时，审计链被动追加恢复条目</li>
+              </ul>
               <textarea v-model="rbReason" rows="2" placeholder="处置原因（必填，将随审计链永久留痕）"></textarea>
               <button class="warn" :disabled="busy(`crisis-rb:${selected.id}`)" @click="doRollback">执行回退并上链</button>
             </div>
@@ -574,6 +587,8 @@ textarea { width: 100%; background: #101731; border: 1px solid var(--border); bo
 .inline { display: flex; gap: 8px; }
 .inline select { flex: 1; }
 .warn-box { color: var(--accent2); }
+.rb-sync { margin: 6px 0 8px; padding-left: 18px; font-size: 12px; line-height: 1.7; }
+.rb-sync b { color: var(--text); font-weight: 600; }
 
 .g-list, .t-list { display: flex; flex-direction: column; gap: 10px; }
 .g-card, .t-card { padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }

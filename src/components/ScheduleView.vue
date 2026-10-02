@@ -244,6 +244,7 @@ const KIND_META = {
   create: ['📝', '发起预约'], propose: ['🔁', '提议改期'], confirm: ['✅', '确认'],
   decline: ['🚫', '婉拒'], reject_reschedule: ['↩️', '拒绝改期'], cancel: ['❌', '取消'],
   resume: ['🔄', '重新协商'], rebook: ['📅', '缺席后重约'], complete: ['🎉', '面试完成'],
+  crisis_suspend: ['🛡️', '危机挂起'], crisis_resume: ['🛡️', '危机重约恢复'],
   noshow: ['⚠️', '缺席裁定'], auto_noshow: ['🤖', '系统初判缺席'],
   remind24h: ['⏰', '24小时提醒'], remind1h: ['🔔', '1小时提醒'], remind: ['📣', '手动提醒'],
   system: ['ℹ️', '系统']
@@ -292,7 +293,8 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
             <span class="tag">{{ a.position }}</span>
             <span class="round-tag">{{ a.round }}</span>
             <span class="st" :class="statusClass(a.status)">{{ a.status_label }}</span>
-            <em v-if="minePending(a)" class="mine-flag">待我处理</em>
+            <em v-if="a.crisis_suspended" class="crisis-flag" @click.stop>🛡️ 危机挂起</em>
+            <em v-else-if="minePending(a)" class="mine-flag">待我处理</em>
           </div>
           <div class="ac-time">
             <span class="clock">🕒</span>
@@ -436,7 +438,11 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
           📅 {{ detail.candidate }} <span class="tag">{{ detail.position }}</span>
           <span class="round-tag">{{ detail.round }}</span>
           <span class="st" :class="statusClass(detail.status)">{{ detail.status_label }}</span>
+          <span v-if="detail.crisis_suspended" class="crisis-flag big">🛡️ 危机处置挂起</span>
         </h3>
+        <div class="crisis-banner" v-if="detail.crisis_suspended">
+          🛡️ 该预约因关联危机事件的流程回退被同步挂起，时段已释放；可在本单<b>重新协商</b>恢复，双方确认后面试流程继续，恢复动作会写入危机审计链。
+        </div>
 
         <!-- 时间与确认位 -->
         <div class="d-timecard" :class="{ resch: detail.status === 'rescheduling' }">
@@ -505,7 +511,9 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
           </template>
 
           <template v-if="['declined','cancelled'].includes(detail.status)">
-            <button class="primary" :disabled="store.myRole === 'hiring_manager'" @click="openResume">↻ 在本单上重新协商</button>
+            <button class="primary" :disabled="store.myRole === 'hiring_manager'" @click="openResume">
+              {{ detail.crisis_suspended ? '🛡️ 在原单重约，恢复面试流程' : '↻ 在本单上重新协商' }}
+            </button>
           </template>
 
           <button class="ghost" @click="detailId = null">关闭</button>
@@ -625,6 +633,10 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
 .st.noshow { color: var(--red); border-color: rgba(255,107,122,.5); background: rgba(255,107,122,.1); }
 .st.dead { color: var(--muted); border-color: var(--border); }
 .mine-flag { margin-left: auto; font-style: normal; font-size: 10px; color: #1a1400; background: var(--accent2); border-radius: 9px; padding: 1px 8px; }
+.crisis-flag { margin-left: auto; font-style: normal; font-size: 10px; font-weight: 700; color: var(--purple); background: rgba(167,139,250,.15); border: 1px solid rgba(167,139,250,.5); border-radius: 9px; padding: 1px 8px; }
+.crisis-flag.big { font-size: 12px; margin-left: 10px; padding: 2px 10px; }
+.crisis-banner { font-size: 12.5px; line-height: 1.7; color: var(--purple); background: rgba(167,139,250,.08); border: 1px solid rgba(167,139,250,.35); border-radius: 10px; padding: 9px 13px; }
+.crisis-banner b { color: var(--purple); }
 .ac-time { font-size: 15px; display: flex; gap: 7px; align-items: center; }
 .ac-time .old { text-decoration: line-through; color: var(--muted); }
 .newtime { font-size: 12px; color: var(--accent2); }

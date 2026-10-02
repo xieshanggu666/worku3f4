@@ -182,6 +182,43 @@ function apptTitle(appt) {
   return `${ctx?.candidate_name || '候选人'} · ${ctx?.position_name || ''} · ${appt.round}`
 }
 
+// ================= 危机回退联动（供危机模块在同一事务内调用） =================
+// 不自带事务/权限校验：调用方（危机回退）已完成鉴权并开启事务，本函数失败随主事务一起回滚。
+// 把该应聘「进行中」的预约（待确认/已确认/改期协商）全部取消：释放时段占用、写沟通留痕、
+// 同步 interviews 表并通知双方；被取消的预约之后可通过 /appointments/:id/resume 重新协商（重约），
+// 使后续面试流程按「重约」结果恢复。
+export function cancelAppointmentsForCrisis(applicationId, { actor = null, reason = '' } = {}) {
+  const list = db.prepare(`SELECT * FROM appointments
+                           WHERE application_id=? AND status IN ('negotiating','confirmed','rescheduling')
+                           ORDER BY id`).all(num(applicationId))
+  const stamp = ts()
+  const cancelled = []
+  list.forEach(appt => {
+    releaseSlots(appt.id)
+    db.prepare(`UPDATE appointments SET status='cancelled',final_result='cancelled',
+                pending_start='',pending_end='',pending_format='',pending_location='',pending_by_party='',
+                updated_at=?,completed_at=?,version=version+1 WHERE id=?`)
+      .run(stamp, stamp, appt.id)
+    addMessage(appt.id, {
+      kind: 'cancel', party: 'system', actor,
+      start: appt.start_at, end: appt.end_at,
+      content: `危机处置回退联动取消：${reason}；如需继续面试，可在本单重新协商（重约）`
+    })
+    syncInterview(appt, { cancelled: true })
+    notifyBoth(appt, actor?.role || '', 'sched_cancelled', '面试预约因危机处置取消',
+      `「${apptTitle(appt)}」因危机回退处置被取消：${reason}；后续可在预约沟通中重新约期`)
+    cancelled.push({ id: appt.id, round: appt.round, from_status: appt.status, start_at: appt.start_at })
+  })
+  return cancelled
+}
+
+// 进行中预约数：危机复活场景下流程恢复后这些预约继续有效，供审计链回写与返回值说明
+export function countActiveAppointments(applicationId) {
+  return num(db.prepare(`SELECT COUNT(*) c FROM appointments
+                         WHERE application_id=? AND status IN ('negotiating','confirmed','rescheduling')`)
+    .get(num(applicationId)).c)
+}
+
 // ================= 状态汇总（供 /api/state 挂载） =================
 export function getScheduleState() {
   const slots = db.prepare('SELECT * FROM schedule_slots ORDER BY start_at').all().map(s => ({

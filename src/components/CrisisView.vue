@@ -41,8 +41,8 @@ function appLabel(appId) {
   const a = appOf(appId)
   return a ? `${a.candidate} · ${a.position}` : ''
 }
-function openIncident(i) { selectedId.value = i.id; tab.value = 'chain' }
-function closeDrawer() { selectedId.value = 0 }
+function openIncident(i) { selectedId.value = i.id; tab.value = 'chain'; lastRollback.value = null }
+function closeDrawer() { selectedId.value = 0; lastRollback.value = null }
 
 // 立案表单
 const showDeclare = ref(false)
@@ -77,10 +77,21 @@ async function addGrant() {
   if (r?.ok) gForm.value = { grantee_id: '', role: 'interviewer', reason: '' }
 }
 const rbReason = ref('')
+const lastRollback = ref(null)
 async function doRollback() {
   if (!rbReason.value.trim()) { store.notify('error', '危机回退必须填写处置原因'); return }
   const r = await store.crisisRollback(selected.value.id, { reason: rbReason.value })
-  if (r?.ok) { rbReason.value = ''; store.notify('success', `已回退：${r.fromLabel} → ${r.toLabel}`) }
+  if (r?.ok) {
+    rbReason.value = ''
+    lastRollback.value = r
+    const parts = []
+    if (r.revived) parts.push('淘汰已复活，后续流程恢复')
+    if (r.appointmentsCancelled?.length) parts.push(`取消预约 ${r.appointmentsCancelled.length} 条（可重约）`)
+    if (r.appointmentsKept) parts.push(`进行中预约 ${r.appointmentsKept} 条继续有效`)
+    if (r.tasksVoided?.length) parts.push(`撤销待审 ${r.tasksVoided.length} 项`)
+    if (r.notificationsCleared) parts.push(`清理未读通知 ${r.notificationsCleared} 条`)
+    store.notify('success', `已回退：${r.fromLabel} → ${r.toLabel}${parts.length ? '；' + parts.join('，') : ''}`)
+  }
 }
 const tkForm = ref({ title: '', content: '', priority: 'P2', owner_id: '' })
 async function addTicket() {
@@ -341,9 +352,25 @@ function roleChip(role) { return ROLE_LABEL[role] || role }
             </div>
             <div class="op-card card" v-if="selected.application_id">
               <h3>⏪ 危机状态回退</h3>
-              <p class="muted">将关联应聘「{{ appLabel(selected.application_id) }}」回退到上一阶段（淘汰记录按来源复活；Offer 阶段会联动撤回 Offer）。该操作豁免前端乐观锁并直接上链。</p>
+              <p class="muted">将关联应聘「{{ appLabel(selected.application_id) }}」回退到上一阶段（淘汰记录按来源复活；Offer 阶段会联动撤回 Offer）。同一事务内同步处置：进行中的面试预约联动取消并释放时段（后续可在预约沟通中重约）、待审任务留痕撤销、失效未读通知清理，处置明细全部回写审计链。该操作豁免前端乐观锁。</p>
               <textarea v-model="rbReason" rows="2" placeholder="处置原因（必填，将随审计链永久留痕）"></textarea>
               <button class="warn" :disabled="busy(`crisis-rb:${selected.id}`)" @click="doRollback">执行回退并上链</button>
+              <div class="rb-result" v-if="lastRollback">
+                <b>✅ 最近回退：{{ lastRollback.fromLabel }} → {{ lastRollback.toLabel }}<template v-if="lastRollback.revived">（淘汰复活）</template></b>
+                <ul>
+                  <li v-if="lastRollback.followup === 'rebook'">
+                    后续流程按「重约」恢复：{{ lastRollback.appointmentsCancelled.map(a => a.round).join('、') }} 已取消并释放时段，请前往「📅 预约沟通」重新约期
+                  </li>
+                  <li v-else-if="lastRollback.followup === 'revived'">
+                    后续流程按「复活」恢复：流程已回到「{{ lastRollback.toLabel }}」阶段{{ lastRollback.appointmentsKept ? `，${lastRollback.appointmentsKept} 条进行中预约继续有效` : '' }}，可继续推进
+                  </li>
+                  <li v-if="lastRollback.tasksVoided?.length">
+                    已撤销待审任务：{{ lastRollback.tasksVoided.map(t => `${t.type_label} #${t.id}`).join('、') }}（申请人可按新状态重新提交）
+                  </li>
+                  <li v-if="lastRollback.notificationsCleared">已清理失效未读通知 {{ lastRollback.notificationsCleared }} 条</li>
+                  <li v-if="lastRollback.offerWithdrawn">进行中的 Offer 已联动撤回</li>
+                </ul>
+              </div>
             </div>
             <div class="op-card card" v-if="isCommander">
               <h3>🔀 移交指挥权（责任变更回写通知）</h3>
@@ -571,6 +598,9 @@ textarea { width: 100%; background: #101731; border: 1px solid var(--border); bo
 .op-card { padding: 13px 15px; }
 .op-card h3 { margin: 0 0 8px; font-size: 13.5px; }
 .op-card textarea, .op-card input { width: 100%; }
+.rb-result { margin-top: 10px; border: 1px solid rgba(87,214,160,.4); background: rgba(87,214,160,.06); border-radius: 10px; padding: 10px 12px; font-size: 12.5px; }
+.rb-result b { color: var(--green); font-size: 12.5px; }
+.rb-result ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); line-height: 1.8; }
 .inline { display: flex; gap: 8px; }
 .inline select { flex: 1; }
 .warn-box { color: var(--accent2); }

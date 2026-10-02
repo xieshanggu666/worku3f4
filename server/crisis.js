@@ -380,6 +380,8 @@ router.post('/grants/:gid/revoke', wrap((req, res) => {
 }))
 
 // ---------------- 危机状态回退（跨角色紧急处置，复用主流程状态机） ----------------
+// 同一事务内同步处置：进行中面试预约联动取消（复活场景保留）、待审任务撤销、失效未读通知清理，
+// 处置明细全部回写审计链；后续流程按「重约（预约取消后重新协商）/复活（淘汰恢复）」结果接续
 router.post('/incidents/:id/rollback', wrap((req, res) => {
   const user = currentUser(req)
   const incidentId = num(req.params.id)
@@ -393,19 +395,30 @@ router.post('/incidents/:id/rollback', wrap((req, res) => {
     const appId = num(req.body?.application_id) || num(inc.application_id)
     if (!appId) badRequest('该事件未关联应聘记录，请在立案时关联或显式指定 application_id', 'app_missing')
     // 与主流程共用 rollbackStage：撤回联动 Offer、写 rollback 阶段事件均保持一致；危机处置豁免乐观锁
-    const r = core.rollbackForIncident(appId, user.name, reason)
+    const r = core.rollbackForIncident(appId, user.name, reason, actorOf(user))
+    const side = [
+      r.appointmentsCancelled?.length ? `取消进行中预约 ${r.appointmentsCancelled.length} 条（可在预约沟通中重约）` : '',
+      r.appointmentsKept ? `进行中预约 ${r.appointmentsKept} 条随流程恢复继续有效` : '',
+      r.tasksVoided?.length ? `撤销待审任务 ${r.tasksVoided.length} 项` : '',
+      r.notificationsCleared ? `清理失效未读通知 ${r.notificationsCleared} 条` : ''
+    ].filter(Boolean).join('；')
     appendEntry(inc.id, {
       category: 'rollback', action: 'state.rollback', actor: actorOf(user),
       refType: 'application', refId: appId,
-      summary: `危机处置状态回退：${r.fromLabel} → ${r.toLabel}`,
+      summary: `危机处置状态回退：${r.fromLabel} → ${r.toLabel}${r.revived ? '（淘汰复活）' : ''}${side ? `；同步处置：${side}` : ''}`,
       detail: {
         application_id: appId, from: r.from, to: r.to, reason,
-        via: 'crisis_command', offer_withdrawn: !!r.offerWithdrawn
+        via: 'crisis_command', offer_withdrawn: !!r.offerWithdrawn,
+        revived: !!r.revived, followup: r.followup,
+        appointments_cancelled: r.appointmentsCancelled || [],
+        appointments_kept: r.appointmentsKept || 0,
+        tasks_voided: r.tasksVoided || [],
+        notifications_cleared: r.notificationsCleared || 0
       }
     })
     notifyAllRoles('crisis_rollback', {
       title: `⏪ ${inc.code} 执行状态回退`,
-      body: `${user.name} 因「${reason}」将应聘流程从「${r.fromLabel}」回退到「${r.toLabel}」`,
+      body: `${user.name} 因「${reason}」将应聘流程从「${r.fromLabel}」回退到「${r.toLabel}」${side ? `；同步处置：${side}` : ''}`,
       appId, incidentId: inc.id, owner: { id: inc.commander_id, name: inc.commander_name }
     })
     return { ok: true, ...r }

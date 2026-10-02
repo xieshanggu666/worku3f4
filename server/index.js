@@ -3,7 +3,7 @@ import db, { ts, now, DEFAULT_WEIGHTS, DEFAULT_KEYWORD_CAP } from './db.js'
 import {
   router as crisisRouter, bindCrisisCore, auditPassive, getCrisisState
 } from './crisis.js'
-import { router as scheduleRouter, getScheduleState } from './schedule.js'
+import { router as scheduleRouter, getScheduleState, cancelAppointmentsForCrisis, countActiveAppointments } from './schedule.js'
 
 const app = express()
 app.use(express.json())
@@ -50,21 +50,82 @@ const conflict = (msg, code = 'conflict') => { throw new ApiError(409, code, msg
 const forbidden = (msg, code = 'forbidden') => { throw new ApiError(403, code, msg) }
 
 // 危机处置模块回退执行器：在危机模块自己的事务内调用，豁免乐观锁版本（紧急处置可能面对过期页面），
-// 但仍走与 /rollback 完全相同的状态机（撤回联动 Offer、rollback 阶段事件、淘汰复活）
-function rollbackForIncident(applicationId, operatorName, reason) {
+// 但仍走与 /rollback 完全相同的状态机（撤回联动 Offer、rollback 阶段事件、淘汰复活）。
+// 同一事务内同步处置在途事项：进行中面试预约联动取消（复活场景保留）、待审任务留痕撤销、
+// 已失效的未读通知清理；处置明细随返回值交危机模块回写审计链，并按「重约/复活」结果恢复后续流程。
+function rollbackForIncident(applicationId, operatorName, reason, actor = null) {
   const a = db.prepare('SELECT * FROM applications WHERE id=?').get(num(applicationId))
   if (!a) badRequest('关联应聘记录不存在', 'app_missing')
   const from = a.stage
+  const revived = from === 'rejected'
   const offerBefore = offerOfApp(a.id)
   rollbackStage(a, { operator: operatorName, reason })
-  if (a.stage === 'rejected') db.prepare("UPDATE applications SET reject_from='' WHERE id=?").run(a.id)
+  // 复活场景：清空淘汰来源，与面试结论改判复活的口径一致，后续流程自恢复阶段继续
+  if (revived) db.prepare("UPDATE applications SET reject_from='' WHERE id=?").run(a.id)
   const offerAfter = offerOfApp(a.id)
+
+  // 同步处置顺序：先清理失效未读通知，再产生联动取消/撤销的新通知，避免误伤新待办
+  const activeAppts = countActiveAppointments(a.id)
+  const notificationsCleared = clearStaleNotificationsForCrisis(a.id, {
+    includeSchedule: !revived && activeAppts > 0
+  })
+  // 回退（纠偏）场景：进行中预约全部取消并释放时段，后续按「重约」恢复；复活场景：预约保留继续有效
+  const appointmentsCancelled = revived ? [] : cancelAppointmentsForCrisis(a.id, { actor, reason })
+  const appointmentsKept = revived ? activeAppts : 0
+  const tasksVoided = voidPendingTasksForCrisis(a, { actor, reason })
+
   return {
     from, to: a.stage,
     fromLabel: STAGE_LABEL[from] || from, toLabel: STAGE_LABEL[a.stage] || a.stage,
     version: a.version,
-    offerWithdrawn: !!offerBefore && offerBefore.status !== 'withdrawn' && offerAfter?.status === 'withdrawn'
+    revived,
+    followup: revived ? 'revived' : (appointmentsCancelled.length ? 'rebook' : 'plain'),
+    offerWithdrawn: !!offerBefore && offerBefore.status !== 'withdrawn' && offerAfter?.status === 'withdrawn',
+    appointmentsCancelled,
+    appointmentsKept,
+    tasksVoided,
+    notificationsCleared
   }
+}
+
+// 危机回退联动：撤销该应聘全部待审任务。流程阶段已被危机处置改变，原申请内容
+// （提交时锁定的目标阶段/薪资/结论）不再可信，留痕撤销并通知申请人与当前审批人按新状态重新评估
+function voidPendingTasksForCrisis(app, { actor, reason }) {
+  const tasks = db.prepare("SELECT * FROM approval_tasks WHERE application_id=? AND status='pending' ORDER BY id").all(app.id)
+  const stamp = ts()
+  const voided = []
+  tasks.forEach(t => {
+    const label = TASK_TYPES[t.type]?.label || t.type
+    db.prepare("UPDATE approval_tasks SET status='cancelled', decided_at=?, decide_note=?, version=version+1 WHERE id=?")
+      .run(stamp, `危机回退联动撤销：${reason}`, t.id)
+    addStep(t.id, { stepNo: -1, role: actor?.role || '', action: 'cancel', actor, note: `危机处置回退联动撤销：${reason}` })
+    notify({
+      recipientRole: t.submitted_role, type: 'task_cancelled',
+      title: `${label}申请因危机处置被撤销`,
+      body: `危机回退处置（${reason}）联动撤销了「${label}」申请 #${t.id}，如仍需办理请按新的流程状态重新提交`,
+      taskId: t.id, appId: app.id
+    })
+    const approverRole = parseJSON(t.chain, [])[t.current_step]?.role
+    if (approverRole && approverRole !== t.submitted_role) {
+      notify({
+        recipientRole: approverRole, type: 'task_cancelled',
+        title: `${label}申请已撤销，无需再审批`,
+        body: `「${label}」申请 #${t.id} 因危机回退处置被撤销：${reason}`,
+        taskId: t.id, appId: app.id
+      })
+    }
+    voided.push({ id: t.id, type: t.type, type_label: label })
+  })
+  return voided
+}
+
+// 危机回退联动：把该应聘已失效的未读通知（待审提醒；预约被取消时的协商/提醒）标记已读，
+// 避免各角色继续处理已被回退推翻的待办。须先于联动产生的新通知执行
+function clearStaleNotificationsForCrisis(applicationId, { includeSchedule = false } = {}) {
+  const cond = includeSchedule ? "(type LIKE 'task_%' OR type LIKE 'sched_%')" : "type LIKE 'task_%'"
+  const r = db.prepare(`UPDATE notifications SET is_read=1 WHERE application_id=? AND is_read=0 AND ${cond}`)
+    .run(num(applicationId))
+  return num(r.changes)
 }
 
 // ---------------- 角色与审批链 ----------------
